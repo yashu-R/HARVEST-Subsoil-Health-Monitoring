@@ -1,0 +1,87 @@
+START
+
+1. Initialize NanoVNA connection
+   vna = VNA(port)
+
+2. Initialize storage
+   background_s11 = None
+   harvest_s11    = None
+   freqs_ref      = None
+   sweep_count    = 0
+
+3. LOOP forever (or until user stops):
+
+   3.1 Increment sweep counter
+       sweep_count += 1
+
+   3.2 Perform one frequency sweep
+       freqs, s11_mag_db = acquire_sweep(vna)
+
+       # internally:
+       #   set sweep range 600–1200 MHz, 201 points
+       #   call vna.sweep()
+       #   convert complex S11 -> magnitude in dB
+
+   3.3 Classify sweep as BACKGROUND or HARVEST
+       type, metric = classify_sweep(s11_mag_db)
+
+       # metric = min(S11 dB)
+       # if metric < threshold  → BACKGROUND
+       # else                   → HARVEST
+
+   3.4 If BACKGROUND:
+           background_s11 = s11_mag_db
+           freqs_ref      = freqs
+           print "stored background"
+
+       Else (HARVEST):
+           harvest_s11 = s11_mag_db
+           freqs_ref   = freqs
+           print "stored harvest"
+
+           IF background_s11 is missing:
+               print "no background yet, skip processing"
+               GOTO next loop iteration
+
+           ELSE:
+               # ----- PROCESSING PIPELINE -----
+
+               3.4.1 Compute absolute sensor response
+                     abs_resp = background_s11 - harvest_s11
+
+               3.4.2 Smooth the response (noise reduction)
+                     smoothed = smooth_signal(abs_resp)
+                     # simple moving average
+
+               3.4.3 Extract resonant features around target peaks
+                     res = extract_resonances(freqs_ref, smoothed)
+
+                     # res contains:
+                     #   f1_freq_hz, f1_amp  (around 600–650 MHz)
+                     #   f2_freq_hz, f2_amp  (around 850–900 MHz)
+                     #   f3_freq_hz, f3_amp  (around 1050–1100 MHz, reference)
+
+               3.4.4 Map to physical quantities using calibration curves
+
+                     VWC = M_VWC * f2_freq_hz + C_VWC
+                     EC  = M_EC  * f1_amp     + C_EC
+
+                     # VWC depends on 2nd peak frequency
+                     # EC  depends on 1st peak amplitude
+
+               3.4.5 Send only VWC and EC to ThingSpeak
+
+                     send_to_thingspeak(VWC, EC)
+                     # HTTP POST → field1 = VWC, field2 = EC
+
+   3.5 Wait for a fixed interval before next sweep
+       sleep(MEASUREMENT_INTERVAL_SEC)
+
+END LOOP
+
+4. On exit, close NanoVNA connection
+   vna.close()
+
+END
+
+
