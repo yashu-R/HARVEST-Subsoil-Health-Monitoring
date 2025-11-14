@@ -1,0 +1,257 @@
+import json
+import time
+from datetime import datetime, timezone
+
+import numpy as np
+import requests
+import pynanovna
+
+# Try Savitzky–Golay; if SciPy not installed, use moving average
+try:
+    from scipy.signal import savgol_filter
+    HAVE_SAVGOL = True
+except ImportError:
+    HAVE_SAVGOL = False
+
+
+# -------------------- USER CONFIG --------------------
+
+SWEEP_START_HZ = 550e6       
+SWEEP_STOP_HZ  = 1.3e9      
+SWEEP_POINTS   = 401
+
+#   if min S11 < threshold -> BACKGROUND
+#   else                   -> HARVEST noisy
+S11_THRESHOLD_DB = -4.0     
+
+# Target resonant frequencies
+TARGET_FREQS_HZ = [650e6, 850e6, 1050e6]
+SEARCH_WINDOW_HZ = 50e6      # ±50 MHz search around each target
+
+# ThingSpeak configuration (cloud database)
+THINGSPEAK_API_KEY = "API_KEY"   # <-- put your key here
+THINGSPEAK_URL = "https://api.thingspeak.com/update"
+
+DEVICE_ID = "harvest-node-01"
+
+# Measurement loop
+MEASUREMENT_INTERVAL_SEC = 5   
+LOOP_FOREVER = True            
+
+# -------------------- FREQUENCY SWEEP --------------------
+
+def acquire_sweep(vna):
+    
+    vna.set_sweep(SWEEP_START_HZ, SWEEP_STOP_HZ, SWEEP_POINTS)
+    s11, _, freqs = vna.sweep()  # we only need S11 and frequency
+
+    s11 = np.array(s11, dtype=complex)
+    freqs = np.array(freqs, dtype=float)
+
+    s11_mag_db = 20 * np.log10(np.abs(s11) + 1e-20)  # avoid log(0)
+    return freqs, s11_mag_db
+
+
+def classify_sweep(s11_mag_db):
+    
+    min_s11 = float(np.min(s11_mag_db))
+    if min_s11 < S11_THRESHOLD_DB:
+        return "background", min_s11
+    else:
+        return "harvest", min_s11
+
+
+# -------------------- MAIN PIPELINE --------------------
+
+def main():
+    vna = pynanovna.VNA()
+    background = None
+    harvest = None
+    freqs_ref = None
+
+    try:
+        sweep_count = 0
+
+        while True:
+            sweep_count += 1
+            print(f"\n--- Sweep {sweep_count} ---")
+            print(f"Sweeping {SWEEP_START_HZ/1e6:.1f}–{SWEEP_STOP_HZ/1e6:.1f} MHz "
+                  f"({SWEEP_POINTS} points)")
+
+            freqs, s11_mag_db = acquire_sweep(vna)
+            sweep_type, metric = classify_sweep(s11_mag_db)
+            print(f"Classification: {sweep_type.upper()} "
+                  f"(min |S11| = {metric:.2f} dB)")
+
+            if sweep_type == "background":
+                background = s11_mag_db
+                freqs_ref = freqs
+                print("Stored as BACKGROUND response.")
+            else:
+                harvest = s11_mag_db
+                freqs_ref = freqs
+                print("Stored as HARVEST noisy response.")
+  
+                print("Processing absolute sensor response...")
+
+                abs_resp = background - harvest
+                smoothed = smooth_signal(abs_resp)
+
+                res_features = extract_resonances(freqs_ref, smoothed)
+                print("Resonant features:")
+                for k, v in res_features.items():
+                    if v is None:
+                        print(f"  {k}: None")
+                    elif "freq" in k:
+                        print(f"  {k}: {v/1e6:.3f} MHz")
+                    else:
+                        print(f"  {k}: {v:.3f}")
+
+                vwc = map_to_vwc(res_features)
+                ec = map_to_ec(res_features)
+                print(f"Mapped VWC: {vwc:.3f} (units via calibration)")
+                print(f"Mapped EC : {ec:.3f} (units via calibration)")
+
+                # Build processed payload (ready for cloud/database)
+                timestamp = datetime.now(timezone.utc).isoformat()
+                payload = {
+                    "device_id": DEVICE_ID,
+                    "timestamp_utc": timestamp,
+                    "sweep_config": {
+                        "start_hz": float(SWEEP_START_HZ),
+                        "stop_hz": float(SWEEP_STOP_HZ),
+                        "points": int(SWEEP_POINTS),
+                    },
+                    "classification": {
+                        "background_min_s11_db": float(np.min(background)),
+                        "harvest_min_s11_db": float(np.min(harvest)),
+                        "threshold_db": S11_THRESHOLD_DB,
+                    },
+                    "resonant_features": res_features,
+                    "vwc": vwc,
+                    "ec": ec,
+                }
+
+                send_to_thingspeak(vwc, ec)
+
+            if not LOOP_FOREVER:
+                break
+
+            print(f"Waiting {MEASUREMENT_INTERVAL_SEC} s before next sweep...")
+            time.sleep(MEASUREMENT_INTERVAL_SEC)
+
+    finally:
+        try:
+            vna.close()
+        except AttributeError:
+            pass
+
+
+if __name__ == "__main__":
+    main()
+
+# -------------------- FILTER / UTILS --------------------
+
+def smooth_signal(y):
+    
+        y = np.asarray(y, dtype=float)
+
+    if HAVE_SAVGOL and len(y) >= 11:
+        # window_length must be odd and <= len(y)
+        window_length = 11 if len(y) >= 11 else (len(y) // 2) * 2 + 1
+        polyorder = 3 if window_length > 3 else 2
+        return savgol_filter(y, window_length=window_length, polyorder=polyorder)
+    else:
+        # Simple moving average fallback (window 5)
+        win = 5
+        if len(y) < win:
+            return y
+        kernel = np.ones(win) / win
+        y_pad = np.pad(y, (win // 2, win - 1 - win // 2), mode="edge")
+        return np.convolve(y_pad, kernel, mode="valid")
+
+
+def extract_resonances(freqs_hz, abs_resp):
+      
+    freqs = np.asarray(freqs_hz, dtype=float)
+    abs_resp = np.asarray(abs_resp, dtype=float)
+
+    features = {}
+
+    for idx, f_target in enumerate(TARGET_FREQS_HZ, start=1):
+        f_name = f"f{idx}"  # f1, f2, f3
+
+        mask = (freqs >= f_target - SEARCH_WINDOW_HZ) & (freqs <= f_target + SEARCH_WINDOW_HZ)
+        if not np.any(mask):
+            features[f_name + "_freq_hz"] = None
+            features[f_name + "_amp"] = None
+            continue
+
+        
+        local_resp = abs_resp[mask]
+        local_freqs = freqs[mask]
+
+        local_max_idx = int(np.argmax(local_resp))
+        res_freq = float(local_freqs[local_max_idx])
+        res_amp = float(local_resp[local_max_idx])
+
+        features[f_name + "_freq_hz"] = res_freq
+        features[f_name + "_amp"] = res_amp
+
+    return features
+
+
+# -------------------- CALIBRATION CURVES --------------------
+
+
+M_VWC = -10.0   # slope_VWC_cal 
+C_VWC = 920.5      # intercept_VWC_cal
+
+
+M_EC  = -5.0     # slope_EC_cal
+C_EC  = 9.3       # intercept_EC_cal
+
+
+def map_to_vwc(res_features):
+    
+    f2_freq_hz = res_features.get("f2_freq_hz")
+    if f2_freq_hz is None:
+        # No valid second peak found -> can't compute VWC
+        return None
+
+    vwc = M_VWC * float(f2_freq_hz) + C_VWC
+    return float(vwc)
+
+
+def map_to_ec(res_features):
+        
+    f1_amp = res_features.get("f1_amp")
+    if f1_amp is None:
+        # No valid first peak found -> can't compute EC
+        return None
+
+    ec = M_EC * float(f1_amp) + C_EC
+    return float(ec)
+
+# -------------------- CLOUD / DATABASE --------------------
+
+def send_to_thingspeak(vwc, ec):
+    """
+    Send only VWC and EC to ThingSpeak.
+    field1 = VWC
+    field2 = EC
+    """
+    payload = {
+        "api_key": THINGSPEAK_API_KEY,
+        "field1": "" if vwc is None else round(float(vwc), 6),
+        "field2": "" if ec is None else round(float(ec), 6),
+    }
+
+    try:
+        resp = requests.post(THINGSPEAK_URL, data=payload, timeout=10)
+        if resp.status_code == 200 and resp.text.strip() != "0":
+            print(f"[ThingSpeak] Upload OK, Entry ID: {resp.text.strip()}")
+        else:
+            print(f"[ThingSpeak] Upload FAILED, status={resp.status_code}, body={resp.text}")
+    except Exception as e:
+        print(f"[ThingSpeak] Error: {e}")
